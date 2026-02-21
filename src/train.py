@@ -5,16 +5,35 @@ Usage
 -----
     python src/train.py
 
-Optional flags (edit the CONFIG section below):
-  - TEXT_SOURCE : "dummy" | path to a plain-text file (e.g. text8)
-  - EMBEDDING_DIM, LEARNING_RATE, EPOCHS, WINDOW_SIZE, NEG_SAMPLES
+Configuration is loaded from a .env file in the project root.
+All keys are optional; built-in defaults are used for any missing key.
+If TEXT_SOURCE is set but the file cannot be opened, the script
+automatically falls back to the built-in dummy corpus.
+
+Supported .env keys
+-------------------
+  TEXT_SOURCE   – absolute or relative path to a plain-text corpus
+  EMBEDDING_DIM – integer  (default 100)
+  LEARNING_RATE – float    (default 0.025)
+  EPOCHS        – integer  (default 5)
+  WINDOW_SIZE   – integer  (default 5)
+  NEG_SAMPLES   – integer  (default 5)
+  MIN_COUNT     – integer  (default 5)
+  SUBSAMPLE_T   – float    (default 1e-3)
+  BATCH_SIZE    – integer  (default 128)
+  PRINT_EVERY   – integer  (default 1000, counts batches)
+  MODEL_SAVE_PATH – path prefix for saved model files (default 'models/word2vec')
+  SEED          – integer  (default 42)
 """
 
 import os
 import sys
 import time
 import random
+from typing import List
 import numpy as np
+from pathlib import Path
+from dotenv import dotenv_values
 
 # ---------------------------------------------------------------------------
 # Make sure the src/ directory is on the path when running from project root
@@ -26,22 +45,36 @@ from negative_sampler import NegativeSampler
 from word2vec import Word2Vec
 
 # ===========================================================================
-# CONFIG  –  edit these to change the training run
+# CONFIG  –  loaded from .env (project root), with built-in defaults
 # ===========================================================================
 
-# "dummy"  → use the built-in sample paragraph (good for smoke-testing)
-# Any other string → treated as a path to a plain-text corpus file (e.g. text8)
-TEXT_SOURCE: str = "dummy"
+# The .env file is expected one level above src/
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_ENV_PATH = _PROJECT_ROOT / ".env"
 
-EMBEDDING_DIM: int = 100
-LEARNING_RATE: float = 0.025
-EPOCHS: int = 5
-WINDOW_SIZE: int = 5
-NEG_SAMPLES: int = 5        # negative samples per positive pair
-MIN_COUNT: int = 5          # rare-word threshold
-SUBSAMPLE_T: float = 1e-3   # subsampling threshold
-PRINT_EVERY: int = 1000     # print average loss every N steps
-SEED: int = 42
+_env = dotenv_values(_ENV_PATH)   # empty dict if file is absent
+
+if _ENV_PATH.exists():
+    print(f"[config] Loaded .env from '{_ENV_PATH}'")
+else:
+    print("[config] No .env file found – using built-in defaults.")
+
+def _get(key: str, default: str) -> str:
+    """Return value from .env, then OS environment, then the default."""
+    return _env.get(key) or os.environ.get(key) or default
+
+TEXT_SOURCE: str  = _get("TEXT_SOURCE",   "")          # empty → dummy
+EMBEDDING_DIM: int   = int(_get("EMBEDDING_DIM", "100"))
+LEARNING_RATE: float = float(_get("LEARNING_RATE", "0.025"))
+EPOCHS: int          = int(_get("EPOCHS",         "5"))
+WINDOW_SIZE: int     = int(_get("WINDOW_SIZE",    "5"))
+NEG_SAMPLES: int     = int(_get("NEG_SAMPLES",    "5"))
+MIN_COUNT: int       = int(_get("MIN_COUNT",      "5"))
+SUBSAMPLE_T: float   = float(_get("SUBSAMPLE_T",  "1e-3"))
+BATCH_SIZE: int      = int(_get("BATCH_SIZE",     "128"))
+PRINT_EVERY: int     = int(_get("PRINT_EVERY",    "1000"))  # in batches
+MODEL_SAVE_PATH: str = _get("MODEL_SAVE_PATH",   "models/word2vec")
+SEED: int            = int(_get("SEED",            "42"))
 
 # ===========================================================================
 # Dummy corpus (used when TEXT_SOURCE == "dummy")
@@ -131,16 +164,61 @@ artificial intelligence.
 # ===========================================================================
 
 def load_text() -> str:
-    if TEXT_SOURCE == "dummy":
+    """
+    Try to load the corpus specified by TEXT_SOURCE.
+    Falls back to the built-in dummy corpus in case of an error.
+    """
+    if not TEXT_SOURCE:
+        print("[corpus] TEXT_SOURCE not set – using dummy corpus.")
         return DUMMY_TEXT
-    if not os.path.exists(TEXT_SOURCE):
-        raise FileNotFoundError(
-            f"Corpus file '{TEXT_SOURCE}' not found. "
-            "Set TEXT_SOURCE = 'dummy' to use the built-in sample text."
+
+    try:
+        path = Path(TEXT_SOURCE)
+        if not path.is_absolute():
+            # Resolve relative paths against the project root
+            path = _PROJECT_ROOT / path
+        print(f"[corpus] Trying to load corpus from '{path}' …")
+        text = path.read_text(encoding="utf-8")
+        print(f"[corpus] Loaded {len(text):,} characters from '{path.name}'.")
+        return text
+    except FileNotFoundError:
+        print(f"[corpus] WARNING: '{TEXT_SOURCE}' not found – falling back to dummy corpus.")
+    except OSError as exc:
+        print(f"[corpus] WARNING: Could not read '{TEXT_SOURCE}' ({exc}) – falling back to dummy corpus.")
+
+    return DUMMY_TEXT
+
+
+def get_batches(stream, batch_size: int):
+    """
+    Consume a (center_id, context_id) generator and yield mini-batches.
+
+    Each yield is a tuple (center_ids, context_ids) of np.int32 arrays
+    of shape (B,) where B <= batch_size.  The final batch may be smaller
+    than batch_size if the stream length is not evenly divisible.
+
+    Parameters
+    ----------
+    stream     : iterable of (int, int) pairs
+    batch_size : int
+    """
+    centers:  List[int] = []
+    contexts: List[int] = []
+    for center_id, context_id in stream:
+        centers.append(center_id)
+        contexts.append(context_id)
+        if len(centers) == batch_size:
+            yield (
+                np.array(centers,  dtype=np.int32),
+                np.array(contexts, dtype=np.int32),
+            )
+            centers  = []
+            contexts = []
+    if centers:
+        yield (
+            np.array(centers,  dtype=np.int32),
+            np.array(contexts, dtype=np.int32),
         )
-    print(f"Loading corpus from '{TEXT_SOURCE}' …")
-    with open(TEXT_SOURCE, "r", encoding="utf-8") as fh:
-        return fh.read()
 
 
 def lr_schedule(initial_lr: float, step: int, total_steps: int) -> float:
@@ -193,46 +271,55 @@ def main() -> None:
     print(model)
 
     # ------------------------------------------------------------------
-    # 4. Training loop
+    # 4. Training loop  (mini-batch SGD)
     # ------------------------------------------------------------------
-    print("\nStep 4 – Training …")
+    print(f"\nStep 4 – Training …  (batch_size={BATCH_SIZE})")
     print("=" * 60)
 
-    global_step = 0
-    total_loss = 0.0
+    global_batch = 0   # counts batches (used for lr schedule + PRINT_EVERY)
+    total_loss   = 0.0
+    total_pairs  = 0
 
-    # Estimate total steps for the learning-rate schedule
-    sample_pairs = processor.generate_training_data(apply_subsampling=True)
-    approx_total_steps = len(sample_pairs) * EPOCHS
+    # Estimate total batches for the lr schedule without materialising pairs.
+    # avg pairs/token ≈ WINDOW_SIZE  (dynamic window + both directions cancel)
+    approx_pairs_per_epoch  = len(processor.encoded) * WINDOW_SIZE
+    approx_total_batches    = (approx_pairs_per_epoch // BATCH_SIZE) * EPOCHS
 
     for epoch in range(1, EPOCHS + 1):
-        epoch_start = time.time()
+        epoch_start  = time.time()
+        epoch_loss   = 0.0
+        epoch_pairs  = 0
+        epoch_batches = 0
 
-        # Re-generate training pairs each epoch (subsampling is stochastic)
-        pairs = processor.generate_training_data(apply_subsampling=True)
-        random.shuffle(pairs)
+        # stream_training_pairs yields pairs on-the-fly (no giant list).
+        # Subsampling is re-applied at the start of each epoch.
+        stream = processor.stream_training_pairs(apply_subsampling=True)
 
-        epoch_loss = 0.0
+        for center_ids, context_ids in get_batches(stream, BATCH_SIZE):
+            B = len(center_ids)
 
-        for step_in_epoch, (center_id, context_id) in enumerate(pairs):
-            # Adaptive learning rate
-            model.lr = lr_schedule(LEARNING_RATE, global_step, approx_total_steps)
+            # Adaptive learning rate (per batch)
+            model.lr = lr_schedule(LEARNING_RATE, global_batch, approx_total_batches)
 
-            # Draw negative samples (exclude center and context)
-            neg_ids = sampler.get_negative_samples(center_id, NEG_SAMPLES)
+            # Draw (B, K) negative samples in one vectorised call
+            neg_ids = sampler.get_negative_samples_batch(center_ids, NEG_SAMPLES)
 
-            # One SGD step
-            loss = model.train_step(center_id, context_id, neg_ids)
+            # Mini-batch forward + backward + SGD update
+            mean_loss = model.train_step_batch(center_ids, context_ids, neg_ids)
 
-            epoch_loss += loss
-            total_loss += loss
-            global_step += 1
+            batch_loss    = mean_loss * B
+            epoch_loss   += batch_loss
+            total_loss   += batch_loss
+            epoch_pairs  += B
+            total_pairs  += B
+            global_batch += 1
+            epoch_batches += 1
 
-            if global_step % PRINT_EVERY == 0:
-                avg = total_loss / global_step
+            if global_batch % PRINT_EVERY == 0:
+                avg = total_loss / max(total_pairs, 1)
                 print(
                     f"  Epoch {epoch}/{EPOCHS}  "
-                    f"step {global_step:>8,}  "
+                    f"batch {global_batch:>8,}  "
                     f"avg loss {avg:.4f}  "
                     f"lr {model.lr:.6f}"
                 )
@@ -240,32 +327,46 @@ def main() -> None:
         elapsed = time.time() - epoch_start
         print(
             f"[Epoch {epoch}/{EPOCHS}]  "
-            f"pairs: {len(pairs):,}  "
-            f"epoch loss: {epoch_loss / max(len(pairs), 1):.4f}  "
+            f"batches: {epoch_batches:,}  "
+            f"pairs: {epoch_pairs:,}  "
+            f"epoch loss: {epoch_loss / max(epoch_pairs, 1):.4f}  "
             f"time: {elapsed:.1f}s"
         )
 
     print("\nTraining complete.")
-    print(f"Total steps : {global_step:,}")
-    print(f"Final avg loss : {total_loss / max(global_step, 1):.4f}")
+    print(f"Total batches : {global_batch:,}")
+    print(f"Total pairs   : {total_pairs:,}")
+    print(f"Final avg loss : {total_loss / max(total_pairs, 1):.4f}")
+
+
 
     # ------------------------------------------------------------------
-    # 5. Quick similarity demo
+    # 5. Quick similarity demo  (5 random words from the vocabulary)
     # ------------------------------------------------------------------
     print("\n" + "=" * 60)
     print("Similarity demo")
     print("=" * 60)
 
-    demo_words = ["learning", "network", "data", "language", "intelligence"]
+    all_vocab_words = list(processor.word2id.keys())
+    demo_words = random.sample(all_vocab_words, min(5, len(all_vocab_words)))
+
     for word in demo_words:
-        if word not in processor.word2id:
-            print(f"  '{word}' not in vocabulary – skipping.")
-            continue
         results = model.get_most_similar(
             word, processor.word2id, processor.id2word, top_n=5
         )
         neighbours = ", ".join(f"{w} ({s:.3f})" for w, s in results)
-        print(f"  {word:>15} →  {neighbours}")
+        print(f"  {word:>20} →  {neighbours}")
+
+    
+    # ------------------------------------------------------------------
+    # Save model
+    # ------------------------------------------------------------------
+
+    # Resolve MODEL_SAVE_PATH relative to the project root so the script
+    # works correctly regardless of which directory it is launched from.
+    save_prefix = str(_PROJECT_ROOT / MODEL_SAVE_PATH)
+    model.save_model(save_prefix, processor.id2word)
+    model.export_to_text(save_prefix + "_embeddings.txt", processor.id2word)
 
 
 if __name__ == "__main__":

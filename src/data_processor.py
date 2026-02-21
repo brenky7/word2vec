@@ -133,34 +133,43 @@ class DataProcessor:
         self, apply_subsampling: bool = True
     ) -> List[Tuple[int, int]]:
         """
-        Iterate over the (optionally subsampled) encoded corpus with a
-        sliding window and yield (center_id, context_id) pairs.
+        Materialise all (center_id, context_id) pairs into a list.
+        Prefer stream_training_pairs() for large corpora to avoid
+        allocating the full list in memory.
+        """
+        return list(self.stream_training_pairs(apply_subsampling=apply_subsampling))
+
+    def stream_training_pairs(
+        self, apply_subsampling: bool = True
+    ):
+        """
+        Generator version of generate_training_data.
+
+        Yields (center_id, context_id) pairs one at a time without
+        materialising the full list, which for large corpora (e.g. text8)
+        avoids allocating hundreds of millions of tuples in memory.
+
+        The dynamic window size is re-sampled for every center word,
+        matching the original Word2Vec behaviour.
 
         Parameters
         ----------
         apply_subsampling : bool
             Whether to subsample frequent words before generating pairs.
-
-        Returns
-        -------
-        List of (center_id, context_id) integer tuples.
         """
         corpus = self.subsample() if apply_subsampling else self.encoded
-        pairs: List[Tuple[int, int]] = []
+        n = len(corpus)
 
         for center_pos, center_id in enumerate(corpus):
             # Dynamic window size: sample uniformly in [1, window_size]
             dynamic_window = random.randint(1, self.window_size)
 
             start = max(0, center_pos - dynamic_window)
-            end = min(len(corpus), center_pos + dynamic_window + 1)
+            end = min(n, center_pos + dynamic_window + 1)
 
             for ctx_pos in range(start, end):
-                if ctx_pos == center_pos:
-                    continue
-                pairs.append((center_id, corpus[ctx_pos]))
-
-        return pairs
+                if ctx_pos != center_pos:
+                    yield center_id, corpus[ctx_pos]
 
     # ------------------------------------------------------------------
     # Convenience properties

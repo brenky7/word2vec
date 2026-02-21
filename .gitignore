@@ -209,3 +209,8 @@ __marimo__/
 
 # MAC OS specific files
 .DS_Store
+
+# Project files
+text8
+text8.txt
+models/

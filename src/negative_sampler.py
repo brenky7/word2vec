@@ -84,10 +84,57 @@ class NegativeSampler:
     # Sampling
     # ------------------------------------------------------------------
 
+    def get_negative_samples_batch(
+        self, center_ids: np.ndarray, count: int
+    ) -> np.ndarray:
+        """
+        Draw *count* negative samples for every entry in *center_ids*
+        in a single vectorised call, returning a (B, count) int32 array.
+
+        Each row i is sampled from the smoothed unigram distribution
+        and is guaranteed not to contain center_ids[i].  A per-row
+        fallback fires only when the over-sampled buffer happens to be
+        entirely composed of the target word (practically impossible for
+        large vocabularies).
+
+        Parameters
+        ----------
+        center_ids : np.ndarray, shape (B,)
+        count      : int  – negatives per sample (K)
+
+        Returns
+        -------
+        np.ndarray of shape (B, count), dtype int32.
+        """
+        B = len(center_ids)
+        oversample = count * 2 + 4  # buffer to absorb target collisions
+
+        # One bulk random draw: (B, oversample) table indices
+        indices    = np.random.randint(0, self.table_size, (B, oversample))
+        candidates = self._table[indices]           # (B, oversample)
+
+        result = np.zeros((B, count), dtype=np.int32)
+        for i in range(B):
+            valid = candidates[i][candidates[i] != center_ids[i]]
+            if len(valid) >= count:
+                result[i] = valid[:count]
+            else:
+                # Rare path: fall back to the single-sample method
+                result[i] = np.array(
+                    self.get_negative_samples(int(center_ids[i]), count),
+                    dtype=np.int32,
+                )
+        return result
+
     def get_negative_samples(self, target_id: int, count: int) -> List[int]:
         """
         Draw *count* negative-sample word IDs from the smoothed unigram
         distribution, **excluding** the target word itself.
+
+        Uses a single vectorised NumPy call to sample a small batch and
+        filters in one pass, avoiding a Python while-loop on the hot path.
+        A Python fallback loop runs only when the oversampled batch does
+        not contain enough valid samples (rare for large vocabularies).
 
         Parameters
         ----------
@@ -100,14 +147,23 @@ class NegativeSampler:
         -------
         List[int] of length *count*.
         """
-        negatives: List[int] = []
-        while len(negatives) < count:
-            # Sample a random position in the pre-built table
+        # Over-sample by a small factor to absorb target_id collisions.
+        # 2× + 4 is sufficient unless target_id dominates the table.
+        indices = np.random.randint(0, self.table_size, count * 2 + 4)
+        candidates = self._table[indices]
+        valid = candidates[candidates != target_id]
+
+        if len(valid) >= count:
+            return valid[:count].tolist()
+
+        # Rare fallback: target_id was very frequent and filled the sample.
+        result: List[int] = valid.tolist()
+        while len(result) < count:
             idx = np.random.randint(0, self.table_size)
-            sampled_id = int(self._table[idx])
-            if sampled_id != target_id:
-                negatives.append(sampled_id)
-        return negatives
+            sid = int(self._table[idx])
+            if sid != target_id:
+                result.append(sid)
+        return result
 
     # ------------------------------------------------------------------
     # Convenience
